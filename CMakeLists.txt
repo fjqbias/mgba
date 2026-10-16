@@ -913,6 +913,11 @@ if(DEFINED SWITCH)
 	add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/src/platform/switch ${CMAKE_CURRENT_BINARY_DIR}/switch)
 endif()
 
+if(ANDROID AND BUILD_ANDROID)
+	# Android 前端只负责 JNI 与平台生命周期，模拟核心仍由 libmgba 提供。
+	add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/src/platform/android ${CMAKE_CURRENT_BINARY_DIR}/android)
+endif()
+
 # Binaries
 list(APPEND CORE_SRC
 	${UTIL_SRC}
