@@ -21,6 +21,7 @@ final class NativeBridge {
     static native boolean nativeWaitFrame(long handle, int[] pixels);
     static native int nativeReadAudio(long handle, short[] samples, int frames);
     static native void nativeSetKeys(long handle, int keys);
+    static native void nativeSetSpeed(long handle, float multiplier);
     static native void nativePause(long handle);
     static native void nativeResume(long handle);
 }

@@ -17,6 +17,7 @@
 #include <mgba-util/vfs.h>
 
 #include <stdatomic.h>
+#include <time.h>
 
 #define ANDROID_LOG_TAG "mGBA"
 
@@ -27,6 +28,8 @@ struct AndroidCore {
 	unsigned width;
 	unsigned height;
 	atomic_uint keys;
+	atomic_int speedMilli;
+	uint64_t nextFrameNs;
 	bool configInitialized;
 	bool started;
 };
@@ -44,6 +47,37 @@ static void _androidFrameCallback(struct mCoreThread* thread) {
 	/* 触摸屏和手柄线程只写入原子按键掩码，实际修改核心状态在模拟线程完成。 */
 	uint32_t keys = atomic_load_explicit(&context->keys, memory_order_relaxed);
 	context->core->setKeys(context->core, keys);
+
+	/* Keep selectable fast-forward rates deterministic in the emulation thread.
+	 * A negative value means unlimited speed; normal speed remains sync-gated. */
+	int speedMilli = atomic_load_explicit(&context->speedMilli, memory_order_relaxed);
+	if (speedMilli <= 1000) {
+		context->nextFrameNs = 0;
+		return;
+	}
+	if (speedMilli < 0) {
+		return;
+	}
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	uint64_t nowNs = (uint64_t) now.tv_sec * 1000000000ull + (uint64_t) now.tv_nsec;
+	uint64_t intervalNs = 1000000000ull * 1000ull / (60ull * (uint64_t) speedMilli);
+	if (!intervalNs) {
+		return;
+	}
+	if (!context->nextFrameNs || nowNs > context->nextFrameNs + intervalNs * 4ull) {
+		context->nextFrameNs = nowNs + intervalNs;
+	} else {
+		context->nextFrameNs += intervalNs;
+	}
+	if (context->nextFrameNs > nowNs) {
+		uint64_t waitNs = context->nextFrameNs - nowNs;
+		struct timespec wait = {
+			.tv_sec = (time_t) (waitNs / 1000000000ull),
+			.tv_nsec = (long) (waitNs % 1000000000ull),
+		};
+		nanosleep(&wait, NULL);
+	}
 }
 
 static void _androidRelease(struct AndroidCore* context) {
@@ -91,6 +125,7 @@ static struct AndroidCore* _androidCreate(const void* rom, size_t romSize) {
 	}
 	context->core = core;
 	atomic_init(&context->keys, 0);
+	atomic_init(&context->speedMilli, 1000);
 
 	if (!core->init(core)) {
 		_androidRelease(context);
@@ -246,6 +281,33 @@ JNIEXPORT void JNICALL Java_io_mgba_android_NativeBridge_nativeSetKeys(JNIEnv* e
 	if (context) {
 		atomic_store_explicit(&context->keys, (unsigned) keys, memory_order_relaxed);
 	}
+}
+
+JNIEXPORT void JNICALL Java_io_mgba_android_NativeBridge_nativeSetSpeed(JNIEnv* env, jclass klass, jlong handle, jfloat multiplier) {
+	UNUSED(env);
+	UNUSED(klass);
+	struct AndroidCore* context = (struct AndroidCore*) (uintptr_t) handle;
+	if (!context || !context->started || !context->thread.impl) {
+		return;
+	}
+	int speedMilli;
+	if (multiplier < 0.0f) {
+		speedMilli = -1;
+	} else if (multiplier <= 1.0f) {
+		speedMilli = 1000;
+	} else {
+		speedMilli = (int) (multiplier * 1000.0f + 0.5f);
+		if (speedMilli > 16000) speedMilli = 16000;
+	}
+	atomic_store_explicit(&context->speedMilli, speedMilli, memory_order_relaxed);
+	bool fastForward = speedMilli != 1000;
+	/* Fast-forward releases the video and audio pacing gates. The Java audio
+	 * consumer drains and discards samples while this mode is enabled. */
+	mCoreSyncSetVideoSync(&context->thread.impl->sync, !fastForward);
+	MutexLock(&context->thread.impl->sync.audioBufferMutex);
+	context->thread.impl->sync.audioWait = !fastForward;
+	ConditionWake(&context->thread.impl->sync.audioRequiredCond);
+	MutexUnlock(&context->thread.impl->sync.audioBufferMutex);
 }
 
 JNIEXPORT void JNICALL Java_io_mgba_android_NativeBridge_nativePause(JNIEnv* env, jclass klass, jlong handle) {
